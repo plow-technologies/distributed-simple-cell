@@ -6,23 +6,27 @@
 
 module SimpleStore.Cell.Distributed.REST 
   (
+  -- * Client
     getStoreState
   , postStoreState
   , migrateStoreState
+  -- * Server
+  , serveDistributedCellAPI
   )
   where
 
 import Control.Monad.Trans.Either
 import Crypto.Hash.SHA512 (hashlazy)
 import Data.Aeson 
-import Data.ByteString.Lazy (ByteString, fromStrict)
+import Data.ByteString.Lazy (ByteString, fromStrict, toStrict)
 import Data.Serialize (Serialize())
 import Control.Applicative ((<$>))
 import Data.Proxy
 import Data.Text (Text)
-import qualified Data.Text.Encoding as TS (decodeUtf8)
+import qualified Data.Text.Encoding as TS (decodeUtf8, encodeUtf8)
 import qualified Data.Text.Lazy.Encoding as TL (encodeUtf8, decodeUtf8)
 import DirectedKeys (encodeKey)
+import Network.Wai (Application)
 import Servant.API
 import Servant.Server
 import Servant.Client
@@ -49,7 +53,7 @@ checkStHash st (StHash {..}) = (== stHash) $ fromStrict $ hashlazy $ encode st
 
 -- | The Servant API type of our body
 type DistributedCellAPI st = "migrate" :> ReqBody [st] :> Post [StHash]
-                        :<|> "store" :> QueryParam "stkey" Text :> Get (Maybe st)
+                        :<|> "store" :> QueryParam "st" Text :> Get (Maybe st)
                         :<|> "store" :> ReqBody st :> Post (Maybe StHash)
 
 distributedCellAPI :: Proxy (DistributedCellAPI st)
@@ -100,22 +104,13 @@ migrateStoreState url sts = do
 
 -- | Get a store state from a remote server
 getStoreState :: ( FromJSON st
-                 , ToJSON st
-                 , SimpleCellState st
-                 , key ~ SimpleCellKey st
-                 , src ~ SimpleCellSrc st
-                 , dst ~ SimpleCellDst st
-                 , tm  ~ SimpleCellDateTime st 
-                 , Serialize key
-                 , Serialize src
-                 , Serialize dst
-                 , Serialize tm)
+                 , ToJSON st)
               => BaseUrl -- ^ URL for distributed cell to get from
               -> st      -- ^ Instance of state type with key matching desired state's key
               -> EitherT String IO (Maybe st) -- ^ Left if there were errors with the request, Right Nothing if the key was not found, Right Just if the state was found
 getStoreState url st = 
   let
-    stKey = Just $ TS.decodeUtf8 $ encodeKey $ getKey simpleCellKey st
+    stKey = Just $ TS.decodeUtf8 $ toStrict $ encode st
   in getStoreStateREST stKey url
 
 -- | Update a store state on a remote server
@@ -126,3 +121,32 @@ postStoreState :: (FromJSON st, ToJSON st, Show st)
 postStoreState url st = 
   postStoreStateREST st url >>=
   maybe (right False) (\storeHash -> if checkStHash st storeHash then right True else left $ "Hash does not match: " ++ show (st, storeHash))
+
+-- | Low level WAI application for serving the api
+serveDistributedCellAPIREST :: (FromJSON st, ToJSON st)
+                            => ([st] -> EitherT (Int, String) IO [StHash])
+                            -> (Maybe Text -> EitherT (Int, String) IO (Maybe st)) 
+                            -> (st -> EitherT (Int, String) IO (Maybe StHash))
+                            -> Application
+serveDistributedCellAPIREST migrateHandler getHandler postHandler = serve distributedCellAPI $ migrateHandler :<|> getHandler :<|> postHandler
+
+-- | WAI application for serving the api
+serveDistributedCellAPI :: (FromJSON st, ToJSON st)
+                        => ([st] -> EitherT (Int, String) IO [st]) -- ^ Handler for migrations. Should return list of successfully stored states in the same order as input list of states
+                        -> (st -> EitherT (Int, String) IO (Maybe st)) -- ^ Handler for store gets. Should return the store state if the store is present, or Nothing otherwise.
+                        -> (st -> EitherT (Int, String) IO (Maybe st)) -- ^ Handler for store posts. Should write the state to the proper store if found, and return the written state, or return Nothing if not found
+                        -> Application
+serveDistributedCellAPI migrateHandler getHandler postHandler =
+  serveDistributedCellAPIREST
+  (\sts -> do
+             writtenSts <- migrateHandler sts
+             return $ map makeStHash writtenSts)
+  (maybe 
+    (left (501, "Missing request parameter: st"))
+    (maybe 
+      (left (501, "Could not decode request parameter: st"))
+      getHandler
+     . decode . fromStrict . TS.encodeUtf8))
+  (fmap (fmap makeStHash) . postHandler)
+
+          

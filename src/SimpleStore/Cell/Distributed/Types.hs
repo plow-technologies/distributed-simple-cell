@@ -27,6 +27,8 @@ module SimpleStore.Cell.Distributed.Types
        , MigrationBatchSize(..)
        , setSettingsBaseUrl
        , settingsFromBaseUrl
+       , Queryable(..)
+       , DistributedCellAPIConstraint
        ) where
 
 import Control.Concurrent.STM
@@ -129,6 +131,14 @@ type DistributedCellConstraint cell k src dst tm st = (Distributed cell, CellCon
 class MigrationBatchSize st where
   -- | How many of a thing to queue up before migrating them
   migrationBatchSize :: Proxy st -> Int
+
+-- | Type of queries on a state
+class Queryable st where
+  type QueryType st
+  runQuery :: (Cell c, CellLiveStateType c ~ st) => c -> QueryType st -> IO [st]
+
+-- | 
+type DistributedCellAPIConstraint q st = (Queryable st, q ~ QueryType st, FromJSON st, ToJSON st, FromJSON q, ToJSON q)
 
 -- | Set the hostname and port for a Warp Settings record from a BaseUrl
 setSettingsBaseUrl :: BaseUrl -> Settings -> Settings

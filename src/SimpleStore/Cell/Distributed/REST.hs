@@ -32,6 +32,7 @@ import Servant.API
 import Servant.Server
 import Servant.Client
 import SimpleStore.Cell.Types (CellKey(..), SimpleCellState(..), )
+import SimpleStore.Cell.Distributed.Types (Queryable(..), DistributedCellAPIConstraint)
 
 -- | A hash of a stored type
 data StHash = StHash { stHash :: ByteString } deriving (Eq, Show, Ord)
@@ -54,6 +55,7 @@ checkStHash st (StHash {..}) = (== stHash) $ fromStrict $ hashlazy $ encode st
 -- | The Servant API type of our body
 type DistributedCellAPI st = "migrate"  :> ReqBody [st]           :> Post [StHash]
                         :<|> "retrieve" :> ReqBody [st]           :> Post (Maybe [st])
+                        :<|> "query"    :> ReqBody (QueryType st) :> Post [st]
                         :<|> "delete"   :> ReqBody [st]           :> Post ()
 
 -- | Proxy for the distributed cell API
@@ -68,25 +70,30 @@ distributedCellAPI = Proxy
 -- | Given a base URL, send the given
 --   store states to the remote distributed store at the base URL, and
 --   receive hashes of them if they are successfully stored
-migrateStoreStateREST :: (Eq st, ToJSON st, FromJSON st) => [st] -> BaseUrl -> EitherT String IO [StHash]
+migrateStoreStateREST :: DistributedCellAPIConstraint q st => [st] -> BaseUrl -> EitherT String IO [StHash]
 migrateStoreStateREST = getMSSR $ client distributedCellAPI
   where
-    getMSSR (mssr :<|> _ :<|> _) = mssr
+    getMSSR (mssr :<|> _ :<|> _ :<|> _) = mssr
 
 -- | Retrieve a stored state, possibly through several layers of indirection
-retrieveStoreStateREST :: (Eq st, ToJSON st, FromJSON st) => [st] -> BaseUrl -> EitherT String IO (Maybe [st])
+retrieveStoreStateREST :: DistributedCellAPIConstraint q st => [st] -> BaseUrl -> EitherT String IO (Maybe [st])
 retrieveStoreStateREST = getRSSR $ client distributedCellAPI
   where
-    getRSSR (_ :<|> rssr :<|> _) = rssr
+    getRSSR (_ :<|> rssr :<|> _ :<|> _) = rssr
+
+queryStoreStateREST :: DistributedCellAPIConstraint q st => q -> BaseUrl -> EitherT String IO [st]
+queryStoreStateREST = getQSSR $ client distributedCellAPI
+  where
+    getQSSR (_ :<|> _ :<|> qssr :<|> _) = qssr
 
 -- | Write to a stored state, possibly through several layers of indirection
-deleteStoreStateREST :: (Eq st, ToJSON st, FromJSON st) => [st] -> BaseUrl -> EitherT String IO ()
+deleteStoreStateREST :: DistributedCellAPIConstraint q st => [st] -> BaseUrl -> EitherT String IO ()
 deleteStoreStateREST = getDSSR $ client distributedCellAPI
   where
-    getDSSR (_ :<|> _ :<|> dssr) = dssr
+    getDSSR (_ :<|> _ :<|> _ :<|> dssr) = dssr
 
 -- | Replicate store states to a remote server
-migrateStoreState :: (Show st, Eq st, ToJSON st, FromJSON st) 
+migrateStoreState :: (DistributedCellAPIConstraint q st, Show st)
                   => BaseUrl              -- ^ The URL of the distributed cell to migrate to
                   -> [st]                 -- ^ The states to migrate
                   -> EitherT String IO () -- ^ Unit if successful, error message if unsuccessful
@@ -99,37 +106,46 @@ migrateStoreState url sts = do
               else left $ "Some hashes did not match: " ++ show unmatchedHashes
     else left $ "Number of returned hashes did not match number of sent states: " ++ (show . length) sts ++ " states vs. " ++ (show . length) storeHashes ++ " hashes."
 
+queryStoreState :: DistributedCellAPIConstraint q st
+                => BaseUrl
+                -> q
+                -> EitherT String IO [st]
+queryStoreState url st = queryStoreStateREST st url
+
 -- | Retrieve a store state from a remote server
-retrieveStoreState :: (Eq st, ToJSON st, FromJSON st)
+retrieveStoreState :: DistributedCellAPIConstraint q st
                    => BaseUrl                        -- ^ URL for distributed cell to get from
                    -> [st]                           -- ^ Instance of state type with key matching desired state's key
                    -> EitherT String IO (Maybe [st]) -- ^ Left if there were errors with the request, Right Nothing if the key was not found, Right Just if the state was found
 retrieveStoreState url st = retrieveStoreStateREST st url
 
 -- | Delete a store state on a remote server, proving you have the latest version
-deleteStoreState :: (Eq st, ToJSON st, FromJSON st)
+deleteStoreState :: DistributedCellAPIConstraint q st
                  => BaseUrl              -- ^ URL for the distributed cell to post to
                  -> [st]                 -- ^ State to update
                  -> EitherT String IO () -- ^ Left on error, Right False if no matching state was found to update, Right True if the update was successful
 deleteStoreState url st = deleteStoreStateREST st url
 
 -- | Low level WAI application for serving the api
-serveDistributedCellAPIREST ::  (Eq st, ToJSON st, FromJSON st)
+serveDistributedCellAPIREST :: DistributedCellAPIConstraint q st
                             => ([st] -> EitherT (Int, String) IO [StHash])
                             -> ([st] -> EitherT (Int, String) IO (Maybe [st]))
+                            -> (q    -> EitherT (Int, String) IO [st])
                             -> ([st] -> EitherT (Int, String) IO ())
                             -> Application
-serveDistributedCellAPIREST migrateHandler retrieveHandler deleteHandler = serve distributedCellAPI $ migrateHandler :<|> retrieveHandler :<|>  deleteHandler
+serveDistributedCellAPIREST migrateHandler retrieveHandler queryHandler deleteHandler = serve distributedCellAPI $ migrateHandler :<|> retrieveHandler :<|> queryHandler :<|> deleteHandler
 
 -- | WAI application for serving the api
-serveDistributedCellAPI :: (Eq st, FromJSON st, ToJSON st)
+serveDistributedCellAPI :: DistributedCellAPIConstraint q st
                         => ([st] -> EitherT (Int, String) IO [st]) -- ^ Handler for migrations. Should return list of successfully stored states in the same order as input list of states
                         -> ([st] -> EitherT (Int, String) IO (Maybe [st])) -- ^ Handler for store retrieval. Should return the store state if the store is present, or Nothing otherwise.
+                        -> (q    -> EitherT (Int, String) IO [st])  -- ^ Handler for store queries
                         -> ([st] -> EitherT (Int, String) IO ()) -- ^ Handler for store deletes.
                         -> Application
-serveDistributedCellAPI migrateHandler retrieveHandler deleteHandler =
+serveDistributedCellAPI migrateHandler retrieveHandler queryHandler deleteHandler =
   serveDistributedCellAPIREST
     (fmap (map makeStHash) . migrateHandler) -- Hash the states for return
     retrieveHandler
+    queryHandler
     deleteHandler
 

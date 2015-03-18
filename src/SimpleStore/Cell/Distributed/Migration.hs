@@ -41,7 +41,7 @@ migrationDestinations migration = assocs . fromList . mapMaybe (\state -> fmap (
 
 
 -- | Run the filter function over the store and migrate matching states
-doMigrations :: (Show st, FromJSON st, ToJSON st, Eq st, SimpleCellConstraint cell k src dst tm st, UrlsConstraint urllist) => Migration urllist st -> DistributedCellM urllist st ()
+doMigrations :: (Show st, DistributedCellAPIConstraint q st, SimpleCellConstraint cell k src dst tm st, UrlsConstraint urllist) => Migration urllist st -> DistributedCellM urllist st ()
 doMigrations migration = do
   localCell <- asks localCell
   states <- liftIO $ foldrStoreWithKey
@@ -60,7 +60,7 @@ forkReader readerThread = do
   liftIO $ forkIO $ runReaderT readerThread r
 
 -- | Fork a Warp server exposing the REST API for migration
-forkDistributedCellServer :: (Eq st, FromJSON st, ToJSON st, SimpleCellConstraint cell k src dst tm st) => Settings -> DistributedCellM urllist st (DistributedCellM urllist st ())
+forkDistributedCellServer :: (Eq st, DistributedCellAPIConstraint q st, SimpleCellConstraint cell k src dst tm st) => Settings -> DistributedCellM urllist st (DistributedCellM urllist st ())
 forkDistributedCellServer warpSettings = do
   startStopMVar <- liftIO $ newEmptyMVar -- Unblocks on server start, server stops when contained action runs
   let warpSettings' = setInstallShutdownHandler (putMVar startStopMVar) warpSettings
@@ -68,11 +68,12 @@ forkDistributedCellServer warpSettings = do
   fmap liftIO $ liftIO $ takeMVar startStopMVar
 
 -- | Run a Warp server exposing the REST API for migration
-runDistributedCellServer :: (Eq st, FromJSON st, ToJSON st, SimpleCellConstraint cell k src dst tm st) => Settings -> DistributedCellM urllist st ()
+runDistributedCellServer :: (Eq st, DistributedCellAPIConstraint q st, SimpleCellConstraint cell k src dst tm st) => Settings -> DistributedCellM urllist st ()
 runDistributedCellServer warpSettings =
     (serveDistributedCellAPI
      <$> liftHandler handleMigrateStore
      <*> liftHandler handleRetrieveStore
+     <*> liftHandler handleQueryStore
      <*> liftHandler handleDeleteStore) >>= (liftIO . runSettings warpSettings)
 
 -- | Propagates the settings from the DistributedCellM context to the DistributedHandlerM context,
@@ -103,6 +104,13 @@ handleRetrieveStore :: (SimpleCellConstraint cell k src dst tm st) => [st] -> Di
 handleRetrieveStore keyStates = do
   localCell <- asks localCell
   runMaybeT $ mapM (MaybeT . liftIO . getStore localCell) keyStates >>= (liftIO . mapM getSimpleStore)
+
+-- | Handler for queries.
+handleQueryStore :: (SimpleCellConstraint cell k src dst tm st, DistributedCellAPIConstraint q st)
+                 => q -> DistributedHandlerM urllist st ([st])
+handleQueryStore query = do
+  localCell <- asks localCell
+  liftIO $ runQuery localCell query -- TODO: call downstream cells w/ query
 
 -- | Handler for store deletes
 handleDeleteStore :: (Eq st, SimpleCellConstraint cell k src dst tm st) => [st] -> DistributedHandlerM urllist st ()

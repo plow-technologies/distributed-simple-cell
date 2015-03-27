@@ -1,57 +1,91 @@
-{-# LANGUAGE RecordWildCards #-}     -- For pulling apart settings records, urls, etc
-{-# LANGUAGE RankNTypes #-}          -- For parametricity on the input to withDistributedCell
-{-# LANGUAGE ConstraintKinds #-}     -- For constraint tuples from simple-cell-types
-{-# LANGUAGE TypeFamilies #-}        -- For type families from simple-cell-types
-{-# LANGUAGE DataKinds #-}           -- For type level list of migration urls
-{-# LANGUAGE TypeOperators #-}       -- For type level list of migration urls
-{-# LANGUAGE GADTs #-}               -- For type level list of migration urls
-{-# LANGUAGE ScopedTypeVariables #-} -- For type level list of migration urls
-{-# LANGUAGE KindSignatures #-}      -- For type level list of migration urls
+{-# LANGUAGE RecordWildCards #-}      -- For pulling apart settings records, urls, etc
+{-# LANGUAGE RankNTypes #-}           -- For parametricity on the input to withDistributedCell
+{-# LANGUAGE ConstraintKinds #-}      -- For constraint tuples from simple-cell-types
+{-# LANGUAGE TypeFamilies #-}         -- For type families from simple-cell-types
+{-# LANGUAGE DataKinds #-}            -- For type level list of migration urls
+{-# LANGUAGE TypeOperators #-}        -- For type level list of migration urls
+{-# LANGUAGE GADTs #-}                -- For type level list of migration urls
+{-# LANGUAGE ScopedTypeVariables #-}  -- For type level list of migration urls
+{-# LANGUAGE KindSignatures #-}       -- For type level list of migration urls
 {-# LANGUAGE UndecidableInstances #-} -- For type level list of migration urls
 
 module SimpleStore.Cell.Distributed.Migration
        (
          setSettingsBaseUrl
        , settingsFromBaseUrl
-       , migrationDestinations
-       , doMigrations
-       , runDistributedCellServer
+       , forkDistributedCellServer
+       , tryRetrieveStore
        ) where
 
 import Control.Applicative ((<$>), (<*>))
 import Control.Concurrent (forkIO, ThreadId)
 import Control.Concurrent.MVar
-import Control.Monad.Error.Class (catchError)
+import Control.Concurrent.STM
+import Control.Monad (join)
+import Control.Monad.Error.Class (catchError, throwError)
 import Control.Monad.Reader
 import Control.Monad.Trans.Either (EitherT(..), bimapEitherT, left)
 import Control.Monad.Trans.Maybe (MaybeT(..))
 import Data.Aeson
 import Data.MultiMap (fromList, assocs)
-import Data.Maybe (mapMaybe)
+import Data.Maybe (mapMaybe, catMaybes, listToMaybe)
+import Data.Proxy (Proxy(..))
 import Network.Wai.Handler.Warp
 import SimpleStore
 import SimpleStore.Cell.Distributed.REST
 import SimpleStore.Cell.Distributed.Types
 import SimpleStore.Cell.Types
 import Servant.Common.BaseUrl
+import System.IO.Error (catchIOError)
 
--- | Partition things by migration URL
-migrationDestinations :: (UrlsConstraint urllist) => Migration urllist st -> [st] -> [(BaseUrl, [st])]
-migrationDestinations migration = assocs . fromList . mapMaybe (\state -> fmap (\url -> (url, state)) $ fmap migrationIndexToBaseUrl $ checkMigration migration state)
+tryRetrieveStore :: forall urllist st a. (FromJSON st, ToJSON st, Eq st, UrlList urllist) => st -> (st -> DistributedCellM urllist st (Either String a)) -> DistributedCellM urllist st (Either String a)
+tryRetrieveStore state action =
+  let urls = proxyToBaseUrlList (Proxy :: Proxy urllist) 
+  in runEitherT $ do 
+       retrievedState <- EitherT $ liftIO $ runEitherT $ msum $ flip map urls
+                           (\url -> do
+                               mRetrievedState <- fmap (join . fmap listToMaybe) $ retrieveStoreState url [state]
+                               EitherT $ maybe (return $ Left "State not found") (return . Right) mRetrievedState)
+       result <- EitherT $ action retrievedState
+       EitherT $ liftIO $ fmap (const $ Right ()) $ mapM (runEitherT . flip deleteStoreState [state]) urls
+       return result
 
-
--- | Run the filter function over the store and migrate matching states
-doMigrations :: (Show st, FromJSON st, ToJSON st, Eq st, SimpleCellConstraint cell k src dst tm st, UrlsConstraint urllist) => Migration urllist st -> DistributedCellM urllist st ()
-doMigrations migration = do
+-- | Migrate the states from a queue to the remote cell associated with that queue
+migrateQueue :: (UrlsConstraint urllist, FromJSON st, ToJSON st, Show st, Eq st, SimpleCellConstraint cell key src dst tm st) => MigrationQueues urllist st -> MigrationIndex urllist -> DistributedCellM urllist st (Either String ()) 
+migrateQueue queues index = do
+  let queue = indexMigrationQueues index queues
+      migrationUrl = migrationIndexToBaseUrl index
+  statesToMigrate <- liftIO $ atomically $ swapTVar queue []
   localCell <- asks localCell
-  states <- liftIO $ foldrStoreWithKey
-                       localCell
-                       (\_ _ stLive statesAction -> fmap (stLive :) statesAction)
-                       (return [])
-  let migrationsWithDestinations = migrationDestinations migration states
-  liftIO $ runEitherT (do mapM_ (uncurry migrateStoreState) migrationsWithDestinations
-                          liftIO $ mapM_ (mapM_ (deleteStore localCell) . snd) migrationsWithDestinations)
-           >>= either (const $ return ()) (const $ return ())
+  statesFromStore <- liftIO $ fmap catMaybes $ mapM (\state -> do
+                                                      mStateStore <- getStore localCell state
+                                                      maybe (return Nothing) (fmap Just . getSimpleStore)
+                                                            mStateStore )
+                                                    statesToMigrate
+  liftIO $ runEitherT $ do
+    catchError (do
+       migrateStoreState migrationUrl statesFromStore
+       EitherT $ catchIOError (fmap Right $ mapM_ (deleteStore localCell) statesFromStore)
+                              (\e -> return $ Left $ show e))
+      (\e -> do
+        liftIO $ atomically $ modifyTVar queue (++ statesToMigrate)
+        throwError e)
+                                 
+-- | Check whether a state needs to be enqueued for migration
+possiblyEnqueueState :: MigrationQueues urllist st -> st -> DistributedCellM urllist st ()
+possiblyEnqueueState migrationQueues state = do
+  migration <- asks migration
+  maybe (return ())
+    (\migrationIndex -> liftIO $ atomically $ do
+      let migrationQueue = indexMigrationQueues migrationIndex migrationQueues
+      modifyTVar migrationQueue (state :))
+    $ checkMigration migration state
+
+-- | Given a migration index, lookup a migration queue. 
+indexMigrationQueues :: MigrationIndex urllist -> MigrationQueues urllist st -> TVar [st]
+indexMigrationQueues (MigrationHere _) (MigrationQueuesCons queue _) = queue
+indexMigrationQueues (MigrationThere indexRest) (MigrationQueuesCons _ queueRest) = indexMigrationQueues indexRest queueRest
+-- Other cases ruled out by types, i.e. there are no cases of MigrationIndex typed with '[] and MigrationQueueEmpty is typed with '[]
 
 -- | Fork a thread in a Reader-IO monad stack
 forkReader :: ReaderT r IO () -> ReaderT r IO ThreadId

@@ -11,12 +11,12 @@
 
 module SimpleStore.Cell.Distributed.Types
        (
-         CustomCell(..)
-       , UrlsConstraint
+         UrlsConstraint
        , migrationIndexToBaseUrl
        , proxyToBaseUrl
-       , proxyToBaseUrlList
+       , UrlList(..)
        , MigrationIndex(..)
+       , MigrationQueues(..)
        , Migration(..)
        , DistributedCellSettings(..)
        , DistributedCellM
@@ -25,10 +25,13 @@ module SimpleStore.Cell.Distributed.Types
        , Distributed(..)
        , DistributedCellConstraint
        , MigrationBatchSize(..)
+       , LocalStoreM (..)
+       , LocalStore (..)
        , setSettingsBaseUrl
        , settingsFromBaseUrl
        ) where
 
+import Control.Applicative
 import Control.Concurrent.STM
 import Control.Monad.Reader
 import Control.Monad.Trans.Either (EitherT(..), bimapEitherT, left)
@@ -43,26 +46,6 @@ import Network.Wai.Handler.Warp (Settings, defaultSettings, setHost, setPort)
 import SimpleStore
 import SimpleStore.Cell.Types
 import Servant.Common.BaseUrl
-
-data CustomCell cell k src dst tm st =
-  CustomCell
-    { customInsertStore :: cell -> st -> IO (Either StoreError (SimpleStore st))
-    , customGetStore :: cell -> st -> IO (Maybe (SimpleStore st))
-    , customUpdateStore :: cell -> SimpleStore st -> st -> IO ()
-    , customDeleteStore :: cell -> st -> IO ()
-    , customFoldrStoreWithKey :: forall b . cell -> (CellKey k src dst tm st -> DirectedKeyRaw k src dst tm -> st -> IO b -> IO b) -> IO b -> IO b
-    , customTraverseStoreWithKey_ :: cell -> (CellKey k src dst tm st -> DirectedKeyRaw k src dst tm -> st -> IO ()) -> IO ()
-    , customCell :: cell }
-
-instance (CellConstraint k src dst tm st cell) => Cell (CustomCell cell k src dst tm st) where
-  type CellLiveStateType (CustomCell cell k src dst tm st) = CellLiveStateType cell
-  type CellDormantStateType (CustomCell cell k src dst tm st) = CellDormantStateType cell
-  insertStore (CustomCell {..}) = customInsertStore customCell
-  updateStore (CustomCell {..}) = customUpdateStore customCell
-  deleteStore (CustomCell {..}) = customDeleteStore customCell
-  getStore    (CustomCell {..}) = customGetStore customCell
-  foldrStoreWithKey (CustomCell {..}) = customFoldrStoreWithKey customCell
-  traverseStoreWithKey_ (CustomCell {..}) = customTraverseStoreWithKey_ customCell
 
 data MigrationIndex :: [(Symbol, Nat)] -> * where
   MigrationHere :: Proxy '((url :: Symbol), (port :: Nat)) -> MigrationIndex ('(url, port) ': rest)
@@ -106,7 +89,7 @@ data DistributedCellSettings urllist st =
 
 data MigrationQueues :: [(Symbol, Nat)] -> * -> * where
   MigrationQueuesEmpty :: MigrationQueues '[] st
-  MigrationQueuesCons  :: TVar [st] -> MigrationQueues ('(url, port) ': rest) st
+  MigrationQueuesCons  :: TVar [st] -> MigrationQueues rest st -> MigrationQueues ('(url, port) ': rest) st
 
 -- | Monad in which to implement the distributed simple cell
 type DistributedCellM urllist st a = ReaderT (DistributedCellSettings urllist st) IO a
@@ -121,7 +104,7 @@ type SimpleCellConstraint cell k src dst tm st = (cell ~ SimpleCell k src dst tm
 
 -- | Operation to force a store to be local for some operations
 class Cell c => Distributed c where
-  withLocalStore :: CellLiveStateType c -> (SimpleStore c -> IO a) -> IO a
+  withLocalStore :: c -> CellLiveStateType c -> (SimpleStore (CellLiveStateType c) -> IO a) -> IO a
 
 -- | Constraint on input to bracketed function for distributed cell
 type DistributedCellConstraint cell k src dst tm st = (Distributed cell, CellConstraint k src dst tm st cell)
@@ -137,5 +120,20 @@ setSettingsBaseUrl (BaseUrl {..}) = setHost (fromString baseUrlHost) . setPort b
 -- | Create a default Warp Settings record with a hostname and port from a BaseUrl
 settingsFromBaseUrl :: BaseUrl -> Settings
 settingsFromBaseUrl = flip setSettingsBaseUrl defaultSettings
+
+newtype LocalStoreM (stack :: [*]) urllist st a = LocalStoreM { unLocalStoreM :: DistributedCellM urllist st a }
+
+instance Functor (LocalStoreM stack urllist st) where
+  fmap f = LocalStoreM . fmap f . unLocalStoreM
+
+instance Applicative (LocalStoreM stack urllist st) where
+  pure = LocalStoreM . pure
+  (<*>) (LocalStoreM f) (LocalStoreM x) = LocalStoreM $ f <*> x
+
+instance Monad (LocalStoreM stack urllist st) where
+  return = LocalStoreM . return
+  (LocalStoreM action) >>= f = LocalStoreM $ action >>= unLocalStoreM . f
+
+newtype LocalStore (stack :: [*]) st = LocalStore (SimpleStore st)
 
 

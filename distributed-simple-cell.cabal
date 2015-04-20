@@ -44,3 +44,10 @@ library
                      , stm-containers >= 0.2 && < 0.3
   hs-source-dirs:      src
   default-language:    Haskell2010
+
+Test-Suite test-distributed-simple-cell
+  type: exitcode-stdio-1.0
+  main-is: Main.hs
+  other-modules: TestTypes, Cells, Tests
+  hs-source-dirs: tests
+  build-depends: base, distributed-simple-cell, simple-cell-types, simple-cell, tasty, tasty-hunit, text, directed-keys, simple-store, random, cereal, directory, aeson, transformers

@@ -33,6 +33,7 @@ module SimpleStore.Cell.Distributed.Types
 
 import Control.Applicative
 import Control.Concurrent.STM
+import Control.Monad.IO.Class
 import Control.Monad.Reader
 import Control.Monad.Trans.Either (EitherT(..), bimapEitherT, left)
 import Data.Aeson (FromJSON(), ToJSON())
@@ -134,6 +135,9 @@ instance Monad (LocalStoreM stack urllist st) where
   return = LocalStoreM . return
   (LocalStoreM action) >>= f = LocalStoreM $ action >>= unLocalStoreM . f
 
-newtype LocalStore (stack :: [*]) st = LocalStore (SimpleStore st)
+instance MonadIO (LocalStoreM stack urllist st) where
+  liftIO = LocalStoreM . liftIO
+
+newtype LocalStore (stack :: [*]) st = LocalStore { unLocalStore :: SimpleStore st }
 
 
